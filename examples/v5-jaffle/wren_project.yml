@@ -1,0 +1,5 @@
+schema_version: 6
+name: jaffle_shop
+catalog: wren
+schema: public
+data_source: postgres
