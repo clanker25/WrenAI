@@ -1,0 +1,163 @@
+# Wren SQL — How CTE-Based Modeling Works
+
+Wren Engine rewrites your SQL by injecting CTEs (Common Table Expressions) that expand each MDL model into its underlying database query. Understanding this mechanism helps you diagnose errors and write correct SQL.
+
+---
+
+## The rewrite pipeline
+
+```
+Your SQL (target dialect, e.g. Postgres)
+  → parse & qualify all column references (sqlglot)
+  → identify which models and columns are referenced
+  → per model: wren-core expands the model definition → CTE
+  → inject model CTEs into your query
+  → output final SQL in target dialect
+```
+
+**Example:** Given an MDL with model `orders` backed by table `public.orders` with columns `o_orderkey`, `o_custkey`, `o_totalprice`:
+
+```sql
+-- You write:
+SELECT o_custkey, SUM(o_totalprice) FROM orders GROUP BY 1
+
+-- Engine produces (via dry-plan):
+WITH "orders" AS (
+  SELECT "public"."orders"."o_orderkey",
+         "public"."orders"."o_custkey",
+         "public"."orders"."o_totalprice"
+  FROM "public"."orders"
+)
+SELECT o_custkey, SUM(o_totalprice) FROM orders GROUP BY 1
+```
+
+The CTE named `"orders"` shadows the model name, so the rest of your SQL runs against the CTE as if it were a table.
+
+---
+
+## What the rewriter handles
+
+| Feature | Supported |
+|---------|-----------|
+| `SELECT *` from a model | Yes — expands to all non-hidden, non-relationship columns |
+| JOINs between models | Yes — each model gets its own CTE |
+| Subqueries referencing models | Yes — outer column references are resolved |
+| Table aliases (`FROM orders o`) | Yes — alias tracking maps back to models |
+| User-defined CTEs (`WITH x AS (...)`) | Yes — model CTEs are prepended before user CTEs |
+| `RECURSIVE` WITH clauses | Yes — preserved |
+| Calculated fields / metrics | Yes — wren-core expands them inside the model CTE |
+| `COUNT(*)` without columns | Yes — model CTE selects `1` (only needs rows) |
+
+---
+
+## SQL rules for writing queries
+
+1. **Use model names, not database table names** — write `FROM orders`, not `FROM public.orders`
+2. **Write dialect-neutral SQL** — the engine translates to the target database dialect
+3. **Column names must match the MDL** — use the names defined in `mdl.json`, not the underlying database column names
+4. **Hidden columns are excluded** — columns with `"isHidden": true` are not available in `SELECT *`
+5. **Relationship columns are excluded** — relationship fields don't appear as selectable columns; use JOINs instead
+
+---
+
+## Diagnosing errors with dry-plan
+
+`dry-plan` shows the expanded SQL without connecting to the database. It checks references that can be resolved from the MDL, but a successful plan does not prove that every column or underlying database object is valid.
+
+### Step 1 — Run dry-plan
+
+```bash
+wren dry-plan --sql "SELECT o_custkey, SUM(o_totalprice) FROM orders GROUP BY 1"
+```
+
+### Step 2 — Interpret the result
+
+| dry-plan result | Meaning | Fix |
+|-----------------|---------|-----|
+| **Succeeds** | SQL expansion completed; references outside known MDL schemas may still be unresolved | Inspect the expanded SQL, then use `wren dry-run --sql "SELECT ..."` to validate it against the database |
+| **Fails** with "No model references found" | Your FROM clause doesn't match any MDL model name | Check model names: `wren memory fetch -q "<name>" --type model --threshold 0` |
+| **Fails** with missing-column error | A column you referenced is absent from the visible model schema | Check columns: `wren memory fetch -q "<col>" --model <name> --threshold 0` |
+| **Fails** with "exists in an MDL model source" or "is ambiguous" | The column exists, but needs an explicit source qualifier (including SEMI/ANTI JOIN inputs) | Use the suggested `alias.column` reference; when a table has an alias, use that alias |
+| **Fails** with qualify error | sqlglot can't resolve an ambiguous or unknown column | Qualify the column explicitly: `model_name.column_name` |
+
+### Step 3 — Compare dry-plan output with DB error
+
+- **Checked offline:** Unresolved unqualified columns are rejected when a SELECT's sources and the sources in every enclosing scope that can supply correlated columns are all MDL models. This includes scalar subqueries that reference those models. Whole-row model references such as `SELECT o FROM orders o` are unsupported; select explicit model columns instead.
+- **Needs `dry-run`:** Scopes containing raw tables, user CTEs, derived tables, or `UNNEST` retain partial qualification. Validate these references, correlated references to such outer sources, and underlying physical objects against the database.
+- **Needs execution:** A successful `dry-run` does not establish business correctness. Execute the query and inspect the results before storing it as verified SQL.
+
+Oracle pseudocolumn recognition is not exhaustive; `ORA_ROWSCN` is not currently included.
+
+When execution fails but dry-plan succeeds, compare them side by side:
+
+```bash
+# Get the expanded SQL
+wren dry-plan --sql "SELECT ..." 2>&1
+
+# Run against DB and capture the error
+wren --sql "SELECT ..." 2>&1
+```
+
+Common patterns:
+- **Type mismatch**: The CTE exposes the raw column type; a function may not accept it in the target dialect
+- **Missing table**: The underlying table referenced in the model definition doesn't exist in the database
+- **Permission denied**: The DB user lacks access to the underlying tables
+- **Syntax difference**: Rare — usually means a sqlglot dialect translation gap
+
+---
+
+## Fallback behavior
+
+If the rewriter detects no model references in your SQL (e.g. `SELECT 1` or queries against raw database tables), it falls back to passing the entire query through wren-core's `transform_sql()` directly. This means:
+
+- Queries that don't reference any MDL model still work
+- The fallback path does NOT use CTE injection — it transforms the whole query at once
+- If you expect model expansion but get none, check that your FROM clause uses model names from the MDL
+
+---
+
+## Cube query SQL generation
+
+`wren cube query` doesn't execute SQL directly — it produces SQL from a
+structured CubeQuery input and hands it to the engine. Inspecting
+`--sql-only` output is how an agent reverse-engineers cube expansion logic.
+
+### Generated SQL pattern
+
+```sql
+SELECT DATE_TRUNC('month', o_orderdate) AS created_at__month,
+       o_orderstatus AS status,
+       SUM(o_totalprice) AS revenue,
+       COUNT(*) AS order_count
+FROM orders                                    -- ← cube.baseObject
+WHERE o_orderdate >= '2024-01-01'
+  AND o_orderdate <  '2025-01-01'              -- ← dateRange (end exclusive)
+  AND o_orderstatus = 'completed'              -- ← filter
+GROUP BY 1, 2                                  -- ← GROUP BY ordinals for all dims
+ORDER BY 1
+LIMIT 100
+```
+
+### Key points
+
+- **`FROM` is the cube's `baseObject`** — wren-core then resolves it to the
+  underlying model/view, so all existing model rewrite rules still apply.
+- **Time dimensions use `DATE_TRUNC(granularity, expr)`**; the column alias
+  is `<name>__<granularity>` (e.g., `created_at__month`).
+- **Date range is `[start, end)` half-open** — the `end` day is excluded.
+- **Derived measures inline-expand**: `avg_order_value = revenue / order_count`
+  becomes `(SUM(o_totalprice)) / (COUNT(*))`. Longest dependency name
+  substitutes first to avoid partial-token bugs (e.g., `revenue_2` before
+  `revenue`).
+- **Expressions containing `$` are safe**: Postgres `$1` parameter placeholders
+  and `$$tag$$` dollar-quoted literals are kept literal, not misread as
+  regex capture-group templates.
+
+### Diagnosing cube SQL errors
+
+1. `wren cube query --sql-only ...` to inspect the generated SQL.
+2. If the SQL looks reasonable, run `wren cube query ...` (drop `--sql-only`).
+3. If the execution error is "unknown column / table", the cube YAML's
+   `expression` is likely wrong — not the translator.
+4. If translation itself fails (e.g., cyclic measure), the error is raised
+   before execution and names the offending measure.
